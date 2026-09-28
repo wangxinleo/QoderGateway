@@ -597,8 +597,9 @@ export default function App() {
       const resp = await authedFetch('/ui/accounts/quota')
       const data = await resp.json()
       setQuotaList(data.quotas || [])
+      fetchAccounts()
     } catch { pushToast('ERROR', lang === 'zh' ? '限额查询失败' : 'Quota query failed', '') }
-  }, [authedFetch, lang, pushToast])
+  }, [authedFetch, lang, pushToast, fetchAccounts])
 
   const fetchLogs = useCallback(async () => {
     try { const resp = await authedFetch('/ui/logs'); const data = await resp.json(); setLogs(data) } catch { /* */ }

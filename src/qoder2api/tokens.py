@@ -122,7 +122,7 @@ def get_account_quota(uid: str) -> dict[str, Any]:
     try:
         r = httpx.get(
             f"{base_api}/api/v2/quota/usage",
-            headers={"Authorization": f"Bearer {tok}", "Accept": "application/json", "User-Agent": UA},
+            headers={**_headers(), "Authorization": f"Bearer {tok}", "Accept": "application/json"},
             timeout=20,
         )
     except httpx.HTTPError as e:
@@ -130,7 +130,15 @@ def get_account_quota(uid: str) -> dict[str, Any]:
     if r.status_code != 200:
         return {"ok": False, "uid": uid, "error": f"HTTP {r.status_code}: {r.text[:160]}"}
 
-    q_data = r.json()
+    try:
+        q_data = r.json()
+    except ValueError:
+        # 非 JSON 200 载荷（如 VPC 登录页 HTML）同样按失败处理，避免异常冒泡
+        return {"ok": False, "uid": uid, "error": f"配额响应解析失败: {r.text[:160]}"}
+    # 错误载荷防护：VPC 等端点可能以 200 返回 {"code": ...} 错误体，避免把非配额载荷写成 0
+    quota_keys = ("userQuota", "addOnQuota", "orgResourcePackage")
+    if not isinstance(q_data, dict) or not any(k in q_data for k in quota_keys):
+        return {"ok": False, "uid": uid, "error": f"配额响应异常: {str(q_data)[:160]}"}
     try:
         uq = q_data.get("userQuota") or {}
         addon = q_data.get("addOnQuota") or {}

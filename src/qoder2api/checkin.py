@@ -633,13 +633,41 @@ def get_all_accounts_checkin_overview(force: bool = False) -> dict[str, Any]:
     else:
         accounts_detail = []
 
+    # 企业行同样刷新配额（与个人行相同的有界 fan-out；失败静默回退到存储值）
+    if len(enterprise_rows) > 0:
+        def refresh_enterprise_quota(r: Any) -> None:
+            try:
+                from .tokens import get_account_quota
+                get_account_quota(r["uid"])
+            except Exception:
+                pass
+
+        with ThreadPoolExecutor(max_workers=min(len(enterprise_rows), 8)) as executor:
+            list(executor.map(refresh_enterprise_quota, enterprise_rows))
+
+        # 成功刷新的行取库内最新配额参与求和，失败的行仍是未改写的存储值
+        ent_uids = [r["uid"] for r in enterprise_rows]
+        placeholders = ",".join("?" for _ in ent_uids)
+        with get_db() as conn:
+            fresh_quotas = {
+                fr["uid"]: fr["quota"]
+                for fr in conn.execute(
+                    f"SELECT uid, quota FROM accounts WHERE uid IN ({placeholders})",
+                    tuple(ent_uids),
+                ).fetchall()
+            }
+        enterprise_remaining_credits = sum(
+            _safe_float(fresh_quotas.get(r["uid"], r["quota"])) for r in enterprise_rows
+        )
+    else:
+        enterprise_remaining_credits = 0.0
+
     claimed_count = sum(1 for a in accounts_detail if a["status_code"] == "claimed")
     pending_count = sum(1 for a in accounts_detail if a["status_code"] == "pending")
     waiting_count = sum(1 for a in accounts_detail if a["status_code"] == "waiting_refresh")
     total_credits_claimed_today = claimed_count * 100
     personal_remaining_credits = round(sum(a.pop("rem_credits", 0.0) for a in accounts_detail), 1)
 
-    enterprise_remaining_credits = sum(_safe_float(r["quota"]) for r in enterprise_rows)
     pool_total_remaining_credits = round(personal_remaining_credits + enterprise_remaining_credits, 1)
 
     result = {
