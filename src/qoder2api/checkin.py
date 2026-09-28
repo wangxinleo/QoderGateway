@@ -104,14 +104,17 @@ def _headers(token: str, client_type: str = "10") -> dict[str, str]:
 
 
 def is_enterprise_account(row: Any) -> bool:
-    """判断是否为企业版/团队版账号（免签且不参与每日个人签到加油包福利）。"""
+    """判断是否为企业版/团队版账号（免签且不参与每日个人签到加油包福利）。
+    企业 VPC 域名账号（enterprise_domain 非空）同样视同企业账号。"""
     if row is None:
         return False
     u_type = ""
     plan = ""
+    domain = ""
     if isinstance(row, dict):
         u_type = str(row.get("user_type") or "").strip().lower()
         plan = str(row.get("plan") or "").strip().lower()
+        domain = str(row.get("enterprise_domain") or "").strip()
     else:
         try:
             u_type = str(row["user_type"] or "").strip().lower()
@@ -121,7 +124,11 @@ def is_enterprise_account(row: Any) -> bool:
             plan = str(row["plan"] or "").strip().lower()
         except (KeyError, IndexError, TypeError):
             pass
-    return "team" in u_type or "org" in u_type or "enterprise" in u_type or "team" in plan or "enterprise" in plan
+        try:
+            domain = str(row["enterprise_domain"] or "").strip()
+        except (KeyError, IndexError, TypeError):
+            pass
+    return bool(domain) or "team" in u_type or "org" in u_type or "enterprise" in u_type or "team" in plan or "enterprise" in plan
 
 
 def get_checkin_status(uid: str) -> dict[str, Any]:
@@ -428,10 +435,10 @@ def checkin_all_accounts(force: bool = False) -> dict[str, Any]:
     """为数据库中所有启用的个人版账号执行签到（自动剔除免签的企业团队版）。"""
     with get_db() as conn:
         all_rows = conn.execute(
-            "SELECT uid, name, user_type, plan FROM accounts WHERE enabled = 1"
+            "SELECT uid, name, user_type, plan, enterprise_domain FROM accounts WHERE enabled = 1"
         ).fetchall()
 
-    # 彻底剔除企业版账号，只让个人版账号参与签到
+    # 彻底剔除企业版账号（含企业 VPC 域名账号），只让个人版账号参与签到
     rows = [r for r in all_rows if not is_enterprise_account(r)]
 
     now_sh = datetime.now(TZ_SHANGHAI)

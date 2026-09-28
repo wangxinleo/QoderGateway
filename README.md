@@ -11,6 +11,7 @@
   <img src="https://img.shields.io/badge/react-18-61dafb?logo=react&logoColor=white" alt="React 18">
   <img src="https://img.shields.io/badge/docker-ready-2496ed?logo=docker&logoColor=white" alt="Docker">
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="License">
+  <a href="https://github.com/wangxinleo/QoderGateway/actions/workflows/release.yml"><img src="https://github.com/wangxinleo/QoderGateway/actions/workflows/release.yml/badge.svg" alt="Release"></a>
   <a href="https://linux.do"><img src="https://img.shields.io/badge/LINUX_DO-%E7%A4%BE%E5%8C%BA-blue" alt="LINUX DO"></a>
 </p>
 
@@ -134,6 +135,49 @@ flowchart LR
      ```bash
      uv run qoder2api --port 5050
      ```
+
+---
+
+## 📦 自动发布 / Release Pipeline
+
+推送版本 tag 即自动完成「前端产物校验 → 镜像构建推送 GHCR → 创建 GitHub Release」，发版收敛为两条命令：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+### 发布流程 / Pipeline Stages
+
+1. **verify**：在干净检出上执行 `npm ci && npm run build` 重建前端，并校验 `src/qoder2api/static/` 与已提交内容完全一致（覆盖 modified / untracked / deleted）；随后执行后端语法门槛 `python -m compileall src/qoder2api`。任何不一致（忘记重建或忘记提交静态产物）都会导致流水线**硬失败**，镜像不推送、Release 不创建。发布前请先本地执行 `cd frontend && npm run build` 并提交产物。
+2. **build-and-push**：构建 `Dockerfile` 并推送镜像到 GHCR。
+3. **release**：依据 tag 自动创建 GitHub Release（自动生成 release notes）。
+
+### 镜像地址与拉取 / Image & Tags
+
+- 镜像仓库：`ghcr.io/wangxinleo/qodergateway`（仅使用内置 `GITHUB_TOKEN` 推拉，无需配置额外 secrets）
+
+```bash
+# 拉取最新正式版
+docker pull ghcr.io/wangxinleo/qodergateway:latest
+
+# 按版本号固定（生产环境推荐，删除 tag 不会回收镜像）
+docker pull ghcr.io/wangxinleo/qodergateway:1.0.0
+```
+
+| 触发方式 | 生成镜像标签 | GitHub Release |
+| :--- | :--- | :--- |
+| 推送 tag `v1.2.3` | `1.2.3`、`1.2`、`latest` | 自动创建 |
+| 推送 tag `v1.2.3-rc.1`（预发布） | `1.2.3-rc.1`（不更新 `latest`） | 自动创建 |
+| 手动触发 `workflow_dispatch` | `edge` | 不创建 |
+
+### 手动触发与 GHCR 可见性 / Manual Dispatch & Visibility
+
+- **手动触发**：GitHub Actions 页面选择 `release` 工作流 → `Run workflow`（`workflow_dispatch`），用于试跑或重跑，产出 `edge` 标签镜像（不创建 Release）。
+- **GHCR 包可见性**：镜像包默认私有（不继承仓库公开性）。如需公开，进入包页面 `Package settings` → `Change visibility` → 改为 `Public`；保持私有则拉取前需 `docker login ghcr.io`。
+
+> [!NOTE]
+> 发布流水线只负责构建与镜像分发，不包含自动部署（CD）；服务器更新仍用 `scripts/deploy_remote.py` 手动执行。
 
 ---
 
