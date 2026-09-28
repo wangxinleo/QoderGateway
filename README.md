@@ -140,7 +140,7 @@ flowchart LR
 
 ## 📦 自动发布 / Release Pipeline
 
-推送版本 tag 即自动完成「前端产物校验 → 镜像构建推送 GHCR → 创建 GitHub Release」，发版收敛为两条命令：
+推送版本 tag 即自动完成「前端产物校验 → 镜像构建推送 GHCR → 容器启动冒烟 → 创建 GitHub Release」，发版收敛为两条命令：
 
 ```bash
 git tag v1.0.0
@@ -150,8 +150,9 @@ git push origin v1.0.0
 ### 发布流程 / Pipeline Stages
 
 1. **verify**：在干净检出上执行 `npm ci && npm run build` 重建前端，并校验 `src/qoder2api/static/` 与已提交内容完全一致（覆盖 modified / untracked / deleted）；随后执行后端语法门槛 `python -m compileall src/qoder2api`。任何不一致（忘记重建或忘记提交静态产物）都会导致流水线**硬失败**，镜像不推送、Release 不创建。发布前请先本地执行 `cd frontend && npm run build` 并提交产物。
-2. **build-and-push**：构建 `Dockerfile` 并推送镜像到 GHCR。
-3. **release**：依据 tag 自动创建 GitHub Release（自动生成 release notes）。
+2. **build-and-push**：构建 `Dockerfile` 并推送镜像到 GHCR（并输出本次构建的镜像 digest）。
+3. **smoke**：以本次构建的 digest 拉取镜像并启动容器，轮询 `GET /v1/models`（最长 20 秒）确认服务可用；启动失败即触发流水线**硬失败**并输出容器日志与退出状态，**启动失败的镜像不会创建 Release**。
+4. **release**：依据 tag 自动创建 GitHub Release（自动生成 release notes）；须 smoke 通过后才会运行。
 
 ### 镜像地址与拉取 / Image & Tags
 
