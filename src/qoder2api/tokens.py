@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from .database import get_db
+from .enterprise import enterprise_origins
 
 OPENAPI_GLOBAL = "https://openapi.qoder.sh"
 OPENAPI_CN = "https://openapi.qoder.com.cn"
@@ -23,6 +24,15 @@ REFRESH_INTERVAL = 6 * 3600  # 6 小时
 
 def get_openapi_url(region: str = "cn") -> str:
     return OPENAPI_CN if (region or "").lower() == "cn" else OPENAPI_GLOBAL
+
+
+def openapi_base_for_account(row: Any) -> str:
+    """企业账号 → 派生企业 VPC openapi origin；否则按 region 走公共域名。"""
+    domain = row["enterprise_domain"] if "enterprise_domain" in row.keys() else None
+    if domain:
+        return enterprise_origins(str(domain))["openapi"]
+    region = row["region"] if "region" in row.keys() else "cn"
+    return get_openapi_url(region)
 
 
 def _headers() -> dict[str, str]:
@@ -47,8 +57,7 @@ def refresh_one_account(uid: str) -> dict[str, Any]:
     if not rt:
         return {"ok": False, "uid": uid, "error": "无 refresh_token"}
 
-    region = row["region"] if "region" in row.keys() else "cn"
-    base_api = get_openapi_url(region)
+    base_api = openapi_base_for_account(row)
 
     # drt- → deviceToken/refresh；jrt- → jobToken/refresh
     if rt.startswith("jrt-"):
@@ -109,8 +118,7 @@ def get_account_quota(uid: str) -> dict[str, Any]:
     tok = row["security_oauth_token"] or ""
     if not tok:
         return {"ok": False, "uid": uid, "error": "无 token"}
-    region = row["region"] if "region" in row.keys() else "cn"
-    base_api = get_openapi_url(region)
+    base_api = openapi_base_for_account(row)
     try:
         r = httpx.get(
             f"{base_api}/api/v2/quota/usage",
