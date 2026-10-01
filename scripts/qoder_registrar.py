@@ -148,7 +148,7 @@ def yyds_wait_code(address: str, timeout: float = 120.0) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Device flow 参数（来自 qodercli 逆向：docs/qoder-protocol-research.md §4）
+# Device flow 参数（来自 qodercli 逆向）
 # ---------------------------------------------------------------------------
 def device_flow_params(machine_id: str | None = None) -> dict:
     """生成 PKCE verifier/challenge/nonce 与授权 URL、轮询 URL。"""

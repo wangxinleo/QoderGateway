@@ -219,7 +219,7 @@ def yyds_wait_code(address: str, task_id: str | None = None, timeout: float = 12
 
 
 # ---------------------------------------------------------------------------
-# Device flow（来自 qodercli 逆向：docs/qoder-protocol-research.md §4）
+# Device flow（来自 qodercli 逆向）
 # ---------------------------------------------------------------------------
 def device_flow_params(machine_id: str | None = None) -> dict:
     length = random.randint(43, 128)
