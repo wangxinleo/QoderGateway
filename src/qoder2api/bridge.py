@@ -1,8 +1,9 @@
+import asyncio
 import copy
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,7 +12,7 @@ import httpx
 from . import encoding
 from .auth import SessionContext, bearer_headers
 from .enterprise import enterprise_origins
-from .env import httpx_client_kwargs
+from .env import httpx_client_kwargs, reasoning_mode
 
 
 _QODER_CHAT_PATH_CN = "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
@@ -20,6 +21,8 @@ QODER_CHAT_URL = "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_g
 # 新版协议（Qoder CLI 现行）：OpenAI 兼容端点，纯 Bearer，无 COSY 签名，响应为标准 OpenAI SSE。
 # 性能远优于老版（老版默认带长 reasoning，复杂任务可到分钟级）。
 QODER_CHAT_URL_NEW = "https://api2-v2.qoder.sh/model/v1/chat/completions"
+# pass/ping 模式心跳间隔（秒）：上游静默超过该时长即向客户端补发 SSE 注释帧 `: ping`（仅在上游已产出首条事件后）。
+KEEPALIVE_INTERVAL = 1.0
 
 
 def now_ms() -> int:
@@ -307,10 +310,11 @@ class BridgeDelta:
     role: str = ""
     content: str = ""
     tool_calls: list[dict[str, Any]] | None = None
+    reasoning: str = ""
 
     @property
     def is_empty(self) -> bool:
-        return not self.role and not self.content and not self.tool_calls
+        return not self.role and not self.content and not self.tool_calls and not self.reasoning
 
 
 _ERROR_KEYS = ("code", "errorCode", "error")
@@ -364,6 +368,60 @@ def detect_upstream_error(payload_text: str) -> str:
     return ""
 
 
+def normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    """usage 归一化（预留映射层）：标准 OpenAI 形状原样透传，常见变体键名做轻度映射，不伪造缺失字段。"""
+    normalized = copy.deepcopy(usage)
+    aliases = {
+        "prompt_tokens": ("promptTokens", "input_tokens"),
+        "completion_tokens": ("completionTokens", "output_tokens"),
+        "total_tokens": ("totalTokens",),
+    }
+    for canonical, alternates in aliases.items():
+        if isinstance(normalized.get(canonical), int):
+            continue
+        for alternate in alternates:
+            if isinstance(normalized.get(alternate), int):
+                normalized[canonical] = normalized[alternate]
+                break
+    details = normalized.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        details = {}
+    if not isinstance(details.get("cached_tokens"), int):
+        for source in ("cached_tokens", "cache_read_input_tokens"):
+            if isinstance(normalized.get(source), int):
+                details["cached_tokens"] = normalized[source]
+                break
+    if details:
+        normalized["prompt_tokens_details"] = details
+    return normalized
+
+
+def extract_usage(payload_text: str) -> dict[str, Any] | None:
+    """从一帧载荷提取上游 usage 统计：顶层 `usage`/`raw_usage`，或老协议 `body` 字符串内嵌；均无则 None。"""
+    try:
+        obj = json.loads(payload_text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    for key in ("usage", "raw_usage"):
+        usage = obj.get(key)
+        if isinstance(usage, dict) and usage:
+            return normalize_usage(usage)
+    inner = obj.get("body")
+    if isinstance(inner, str) and inner:
+        try:
+            parsed_inner = json.loads(inner)
+        except (TypeError, ValueError):
+            parsed_inner = None
+        if isinstance(parsed_inner, dict):
+            for key in ("usage", "raw_usage"):
+                usage = parsed_inner.get(key)
+                if isinstance(usage, dict) and usage:
+                    return normalize_usage(usage)
+    return None
+
+
 def extract_delta(data_line: str) -> BridgeDelta:
     try:
         obj = json.loads(data_line)
@@ -375,9 +433,10 @@ def extract_delta(data_line: str) -> BridgeDelta:
                 delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
                 role = delta.get("role") or ""
                 content = delta.get("content") or ""
+                reasoning = delta.get("reasoning_content") or ""
                 tool_calls = delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else None
-                if role or content or tool_calls:
-                    return BridgeDelta(role, content, tool_calls)
+                if role or content or tool_calls or reasoning:
+                    return BridgeDelta(role, content, tool_calls, reasoning)
             return BridgeDelta()
         # 老版：wrapper 内嵌 body 字符串
         inner = obj.get("body") or ""
@@ -388,15 +447,19 @@ def extract_delta(data_line: str) -> BridgeDelta:
             delta = choice.get("delta", {})
             role = delta.get("role") or ""
             content = delta.get("content") or ""
+            reasoning = delta.get("reasoning_content") or ""
             tool_calls = delta.get("tool_calls") if isinstance(delta.get("tool_calls"), list) else None
-            if role or content or tool_calls:
-                return BridgeDelta(role, content, tool_calls)
+            if role or content or tool_calls or reasoning:
+                return BridgeDelta(role, content, tool_calls, reasoning)
     except (TypeError, json.JSONDecodeError):
         return BridgeDelta()
     return BridgeDelta()
 
 
-def make_chunk(chunk_id: str, created: int, model: str, delta: dict[str, Any] | None = None, finish_reason: str | None = None) -> dict[str, Any]:
+def make_chunk(chunk_id: str, created: int, model: str, delta: dict[str, Any] | None = None, finish_reason: str | None = None, usage: dict[str, Any] | None = None) -> dict[str, Any]:
+    if usage is not None:
+        # usage chunk：choices 恒为空数组（OpenAI include_usage 规范形状，[DONE] 前最后一帧）
+        return {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [], "usage": usage}
     return {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": delta or {}, "finish_reason": finish_reason}]}
 
 
@@ -450,6 +513,8 @@ async def qoder_stream_lines(sess: SessionContext, body: dict[str, Any], model: 
             "Authorization": f"Bearer {sess.identity.security_oauth_token}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
+            # 与 CN 分支 auth.py 一致：禁用压缩，避免 httpx 默认 gzip/br 造成粗粒度分块
+            "Accept-Encoding": "identity",
             "User-Agent": "qoder/1.1.16",
             "X-Request-ID": ctx.get("request_id", ""),
             "X-Session-ID": ctx.get("session_id", ""),
@@ -469,31 +534,42 @@ async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> A
     chunk_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     tool_calls = ToolCallAccumulator()
+    mode = reasoning_mode()
     emitted = False
+    content_sent = False
     pending = ""
     streaming_text = False
     pending_role = "assistant"
     reasoning_events = 0
+    usage_snapshot: dict[str, Any] | None = None
 
     def event(payload: dict[str, Any]) -> str:
         return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
-    async for line in qoder_stream_lines(sess, body, model):
-        if not line.startswith("data:"):
-            continue
-        payload_text = line[5:].strip()
+    def process_line(payload_text: str) -> Iterator[str]:
+        """单帧处理：错误上抛 → usage 采集 → reasoning 透传（pass）→ 既有正文/工具调用路径。"""
+        nonlocal emitted, content_sent, pending, streaming_text, pending_role, reasoning_events, usage_snapshot
         # 上游带内错误事件（event: error 的载荷 / 通用错误体）→ 抛错上抛，由 app.py 的重试/轮换接管
         err = detect_upstream_error(payload_text)
         if err:
             raise RuntimeError(f"上游错误事件: {err}")
+        # usage 帧（顶层 usage/raw_usage 或老协议 body 内嵌）：暂存后不 continue——同一帧可能还带 choices/finish
+        usage = extract_usage(payload_text)
+        if usage is not None:
+            usage_snapshot = usage
         delta = extract_delta(payload_text)
         if delta.is_empty:
-            # 统计被丢弃的事件（reasoning 等），仅计数不入流，用于零正文错误的可观测性
-            if payload_text and payload_text != "[DONE]" and "reasoning_content" in payload_text:
-                reasoning_events += 1
-            continue
+            return
         if delta.role:
             pending_role = delta.role
+        if delta.reasoning:
+            reasoning_events += 1
+            if mode == "pass":
+                out_delta = {"reasoning_content": delta.reasoning}
+                if not emitted:
+                    out_delta["role"] = pending_role
+                emitted = True
+                yield event(make_chunk(chunk_id, created, model, out_delta))
         if delta.tool_calls:
             pending = "" if tools_enabled and pending.lstrip().startswith("Tool calls:") else pending
             indexed = []
@@ -506,29 +582,79 @@ async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> A
             if not emitted:
                 out_delta["role"] = pending_role
             emitted = True
+            content_sent = True
             yield event(make_chunk(chunk_id, created, model, out_delta))
-            continue
+            return
         if not delta.content:
-            continue
+            return
         if not tools_enabled or streaming_text:
             out_delta = {"content": delta.content}
             if not emitted:
                 out_delta["role"] = pending_role
             emitted = True
+            content_sent = True
             streaming_text = True
             yield event(make_chunk(chunk_id, created, model, out_delta))
-            continue
+            return
         pending += delta.content
         candidate = pending.lstrip()
-        if "Tool calls:".startswith(candidate) or candidate.startswith("Tool calls:"):
-            continue
+        if "Tool calls:".startswith(candidate):
+            # 严格前缀（"T"/"To"/…）或恰好"Tool calls:"：最多持有一块待下一增量判定
+            return
+        if candidate.startswith("Tool calls:"):
+            tail = candidate[len("Tool calls:") :].lstrip()
+            if not tail or tail.startswith("[") or tail.startswith("```"):
+                # 载荷形状可能是真工具调用（`[` 开头 / ``` 围栏）→ 维持持有，流尾统一解析（行为不变）
+                return
+            # P1-2：前缀后首个非空白字符既非 `[` 也非围栏 → 不可能是工具调用载荷，立即按正文放行
         streaming_text = True
         out_delta = {"content": pending}
         if not emitted:
             out_delta["role"] = pending_role
         emitted = True
+        content_sent = True
         pending = ""
         yield event(make_chunk(chunk_id, created, model, out_delta))
+
+    if mode == "drop":
+        # 逃生舱：保持修复前的 async for 直读路径（无心跳、无 reasoning 透传）
+        async for line in qoder_stream_lines(sess, body, model):
+            if not line.startswith("data:"):
+                continue
+            for out in process_line(line[5:].strip()):
+                yield out
+    else:
+        # pass/ping：任务式等待上游（严禁 asyncio.wait_for——其超时会取消待决 __anext__，毁掉 httpx 流）；
+        # 仅在上游已产出首条事件（received）之后，静默 ≥KEEPALIVE_INTERVAL 才发 SSE 注释心跳，
+        # 保住「上游确认产出前失败仍可在回 200 前换号/重试」的请求级语义。
+        it = qoder_stream_lines(sess, body, model).__aiter__()
+        task: asyncio.Future[str] | None = None
+        received = False
+        try:
+            while True:
+                if task is None:
+                    task = asyncio.ensure_future(it.__anext__())
+                done, _ = await asyncio.wait({task}, timeout=KEEPALIVE_INTERVAL)
+                if not done:
+                    if received:
+                        # `: ping` 是 SSE 注释帧（非语义 chunk），不占 role 注入位，role 留给首个语义增量
+                        yield ": ping\n\n"
+                    continue
+                try:
+                    line = task.result()
+                except StopAsyncIteration:
+                    break
+                finally:
+                    task = None
+                received = True
+                if not line.startswith("data:"):
+                    continue
+                for out in process_line(line[5:].strip()):
+                    yield out
+        finally:
+            # 客户端放弃连接等场景：取消待决上游读取，避免悬挂的 httpx 流
+            if task is not None:
+                task.cancel()
 
     parsed_calls = parse_tool_calls_text(pending) if tools_enabled else None
     if parsed_calls:
@@ -538,16 +664,29 @@ async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> A
             item.setdefault("index", index)
             indexed.append(item)
         tool_calls.append(indexed)
-        yield event(make_chunk(chunk_id, created, model, {"tool_calls": indexed, "role": pending_role} if not emitted else {"tool_calls": indexed}))
+        out_delta = {"tool_calls": indexed}
+        if not emitted:
+            out_delta["role"] = pending_role
+        emitted = True
+        content_sent = True
+        yield event(make_chunk(chunk_id, created, model, out_delta))
     elif pending:
-        yield event(make_chunk(chunk_id, created, model, {"content": pending, "role": pending_role} if not emitted else {"content": pending}))
-        emitted = True  # 该分支同样向客户端下发了正文块，零正文守卫不得在其后触发
+        out_delta = {"content": pending}
+        if not emitted:
+            out_delta["role"] = pending_role
+        emitted = True
+        content_sent = True
+        yield event(make_chunk(chunk_id, created, model, out_delta))
 
-    # 零正文守卫：上游只回 role/reasoning 事件（或整条流无正文）时，不得伪装成 200 空流
-    if not emitted and not tool_calls.calls:
+    # 零正文守卫：上游只回 role/reasoning 事件（或整条流无正文）时，不得伪装成 200 空流；
+    # reasoning 增量与 `: ping` 心跳不解除守卫（content_sent 仅由正文/工具调用下发置位）
+    if not content_sent and not tool_calls.calls:
         raise RuntimeError(f"上游未产出正文（reasoning-only 空流，reasoning_events={reasoning_events}），请重试")
     finish_reason = "tool_calls" if tool_calls.calls else "stop"
     yield event(make_chunk(chunk_id, created, model, {}, finish_reason))
+    # usage 补发（OpenAI include_usage 惯例）：finish 帧之后、[DONE] 之前；上游未提供则不补发（宁缺勿造）
+    if usage_snapshot is not None:
+        yield event(make_chunk(chunk_id, created, model, usage=usage_snapshot))
     yield "data: [DONE]\n\n"
 
 
@@ -557,10 +696,16 @@ async def complete_openai_response(req: dict[str, Any], sess: SessionContext) ->
     created = int(time.time())
     full = []
     tool_calls = ToolCallAccumulator()
+    usage_snapshot: dict[str, Any] | None = None
     async for line in qoder_stream_lines(sess, body, model):
         if not line.startswith("data:"):
             continue
-        delta = extract_delta(line[5:].strip())
+        payload_text = line[5:].strip()
+        # usage 帧（顶层 usage/raw_usage 或老协议 body 内嵌）：采集后继续既有处理（同帧可能还带 choices）
+        usage = extract_usage(payload_text)
+        if usage is not None:
+            usage_snapshot = usage
+        delta = extract_delta(payload_text)
         if delta.content:
             full.append(delta.content)
         if delta.tool_calls:
@@ -583,5 +728,7 @@ async def complete_openai_response(req: dict[str, Any], sess: SessionContext) ->
         "created": created,
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls.calls or fallback_tool_calls else "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        # 回填上游真实 usage；上游未提供时维持零值结构（不伪造数值）
+        "usage": usage_snapshot
+        or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
