@@ -12,6 +12,7 @@
 - 零正文守卫：pass=200 截断（reasoning 已流出）/ drop=502（换号窗口保留）
 - 带内错误（event:error + provider_error）→ 502
 - P1-2：`Tool calls:` 文本立即放行 / 真工具调用正常解析
+- U1–U5（单元）：SSE 拆帧重组 / raw_usage 解包 / 工具空串防御 / 残留帧 WARNING
 - drop 模式：无 reasoning、无心跳（usage 仍转发，按 P0-1 设计）
 - 防御头：X-Accel-Buffering: no；intl 分支 Accept-Encoding: identity
 
@@ -23,7 +24,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -436,6 +439,150 @@ def run_cases(base: str, mock: MockUpstream) -> None:
     check("C10 [DONE] 收尾", dl and dl[-1][1] == "[DONE]")
 
 
+# --------------------------------------------------------------------------
+# 单元用例 U1–U5：拆帧重组 / raw_usage 解包 / 工具空串防御 / 残留帧告警
+# --------------------------------------------------------------------------
+
+
+async def _aiter(items):
+    for item in items:
+        yield item
+
+
+def _collect_async(agen) -> list[str]:
+    async def _collect() -> list[str]:
+        return [item async for item in agen]
+
+    return asyncio.run(_collect())
+
+
+def _sse_payloads(out: list[str]) -> list[dict]:
+    chunks = []
+    for item in out:
+        if not item.startswith("data:"):
+            continue
+        payload = item[5:].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            chunks.append(json.loads(payload))
+        except Exception:
+            pass
+    return chunks
+
+
+class _CaptureHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+
+def _run_stream_with_physical_lines(lines: list[str], tools: bool = True) -> list[str]:
+    """物理行先经重组器、再喂给 stream_openai_response，返回下游 SSE 字符串序列。"""
+    async def fake_qoder_stream_lines(sess, body, model):  # noqa: ARG001
+        async for line in bridge_mod._reassemble_sse_lines(_aiter(lines)):
+            yield line
+
+    req: dict = {"model": "lite", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+    if tools:
+        req["tools"] = [{"type": "function", "function": {"name": "append", "description": "", "parameters": {"type": "object", "properties": {}}}}]
+
+    async def _run() -> list[str]:
+        out: list[str] = []
+        async for chunk in bridge_mod.stream_openai_response(req, None):
+            out.append(chunk)
+        return out
+
+    original = bridge_mod.qoder_stream_lines
+    bridge_mod.qoder_stream_lines = fake_qoder_stream_lines
+    try:
+        return asyncio.run(_run())
+    finally:
+        bridge_mod.qoder_stream_lines = original
+
+
+def run_unit_cases() -> None:
+    print("\n[U1-U5] bridge 单元用例：拆帧重组 / raw_usage 解包 / 工具空串防御 / 残留帧告警", flush=True)
+
+    # U1：usage 大帧在 JSON 中途被物理断行（续行无 data: 前缀）→ 重组为 1 条完整 data: 行
+    usage_inner = {"completion_tokens": 1, "prompt_tokens": 10, "total_tokens": 11}
+    frame_obj = {
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "raw_usage": {"account_discount": 0, "data": dict(usage_inner), "system_fingerprint": None},
+    }
+    frame_text = json.dumps(frame_obj, ensure_ascii=False, separators=(",", ":"))
+    split_at = frame_text.index('"system_fingerp') + len('"system_fingerp')
+    u1_lines = ["data:" + frame_text[:split_at], frame_text[split_at:]]
+    u1_out = _collect_async(bridge_mod._reassemble_sse_lines(_aiter(u1_lines)))
+    u1_evidence = f"out={len(u1_out)}" + (f" head={u1_out[0][:80]!r}" if u1_out else "")
+    check(
+        "U1 拆帧重组：两段物理行 → 1 条完整 data: 行（json.loads 成功）",
+        len(u1_out) == 1 and _sse_payloads(u1_out) == [frame_obj],
+        u1_evidence,
+    )
+
+    # U2：raw_usage 包装解包（data / usage 两种变体各一次）→ 10/1/11
+    u2_data = bridge_mod.extract_usage(u1_out[0][5:].strip()) if u1_out else None
+    data_ok = isinstance(u2_data, dict) and all(u2_data.get(k) == v for k, v in usage_inner.items())
+    check("U2 raw_usage.data 解包 → prompt=10/completion=1/total=11", data_ok, json.dumps(u2_data, ensure_ascii=False))
+    u2_usage = bridge_mod.extract_usage(json.dumps({"raw_usage": {"account_discount": 0, "usage": dict(usage_inner)}}, ensure_ascii=False))
+    usage_ok = isinstance(u2_usage, dict) and all(u2_usage.get(k) == v for k, v in usage_inner.items())
+    check("U2 raw_usage.usage 解包 → prompt=10/completion=1/total=11", usage_ok, json.dumps(u2_usage, ensure_ascii=False))
+
+    # U3：工具头帧拆行 → 重组后 id/name 完整；续帧空串 id/name 经 P3a 后不下发
+    head_obj = {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_9", "type": "function", "function": {"name": "append", "arguments": ""}}]}, "finish_reason": None}]}
+    head_text = json.dumps(head_obj, ensure_ascii=False, separators=(",", ":"))
+    head_split = head_text.index('"name"') + len('"name"')
+    cont_text = json.dumps(
+        {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "", "type": "function", "function": {"name": "", "arguments": '{"path":"/tmp"}'}}]}, "finish_reason": None}]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    u3_out = _run_stream_with_physical_lines(["data:" + head_text[:head_split], head_text[head_split:], "data:" + cont_text])
+    tool_items = [tc for c in _sse_payloads(u3_out) for tc in ((c.get("choices") or [{}])[0].get("delta") or {}).get("tool_calls") or []]
+    head_ok = len(tool_items) >= 1 and tool_items[0].get("id") == "call_9" and (tool_items[0].get("function") or {}).get("name") == "append"
+    check("U3 工具头帧拆行重组：id/name 完整", head_ok, json.dumps(tool_items[:1], ensure_ascii=False)[:200])
+    cont_fn = (tool_items[1].get("function") or {}) if len(tool_items) > 1 else {}
+    cont_ok = len(tool_items) == 2 and "id" not in tool_items[1] and "name" not in cont_fn and cont_fn.get("arguments") == '{"path":"/tmp"}'
+    check("U3 续帧空串 id/name 不下发（P3a）", cont_ok, json.dumps(tool_items[1:2], ensure_ascii=False)[:200])
+
+    # U4：累积器先收头帧，再收空串续帧 → id/name 保留
+    acc = bridge_mod.ToolCallAccumulator()
+    acc.append([{"index": 0, "id": "call_1", "type": "function", "function": {"name": "append", "arguments": ""}}])
+    acc.append([{"index": 0, "id": "", "type": "function", "function": {"name": "", "arguments": "{}"}}])
+    snap = acc.snapshot()
+    check(
+        "U4 累积器：空串 id/name 不覆盖已有值",
+        len(snap) == 1 and snap[0]["id"] == "call_1" and snap[0]["function"]["name"] == "append" and snap[0]["function"]["arguments"] == "{}",
+        json.dumps(snap, ensure_ascii=False),
+    )
+
+    # U5：残留坏帧（遇新帧 / 流结束两条路径）→ 各 1 条 WARNING，输出序列不变
+    capture = _CaptureHandler()
+    bridge_logger = logging.getLogger("qoder2api.bridge")
+    bridge_logger.addHandler(capture)
+    old_level = bridge_logger.level
+    bridge_logger.setLevel(logging.WARNING)
+    try:
+        out_a = _collect_async(bridge_mod._reassemble_sse_lines(_aiter(["data: {broken", 'data:{"ok":1}'])))
+        warn_a = len(capture.records)
+        out_b = _collect_async(bridge_mod._reassemble_sse_lines(_aiter(["data: {broken"])))
+        warn_b = len(capture.records) - warn_a
+    finally:
+        bridge_logger.removeHandler(capture)
+        bridge_logger.setLevel(old_level)
+    msgs = [r.getMessage() for r in capture.records]
+    check(
+        "U5 残留帧告警：遇新帧/流结束各 1 条 WARNING（含 len/head）且输出不变",
+        warn_a == 1 and warn_b == 1 and out_a == ['data: {"ok":1}'] and out_b == [] and all(r.levelno == logging.WARNING for r in capture.records)
+        and all("len=7" in m and "head='{broken'" in m for m in msgs),
+        f"warn_a={warn_a} warn_b={warn_b} out_a={out_a} out_b={out_b} msgs={msgs}",
+    )
+
+
 def main() -> int:
     print("=" * 74)
     print("QoderGateway mock 上游端到端验证（桌面验证）")
@@ -463,6 +610,8 @@ def main() -> int:
     base = f"http://127.0.0.1:{gateway_port}"
     print(f"gateway: {base}")
     print("=" * 74)
+
+    run_unit_cases()
 
     try:
         run_cases(base, mock)
