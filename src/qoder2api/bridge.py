@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -23,6 +24,8 @@ QODER_CHAT_URL = "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_g
 QODER_CHAT_URL_NEW = "https://api2-v2.qoder.sh/model/v1/chat/completions"
 # pass/ping 模式心跳间隔（秒）：上游静默超过该时长即向客户端补发 SSE 注释帧 `: ping`（仅在上游已产出首条事件后）。
 KEEPALIVE_INTERVAL = 1.0
+# P4：被丢弃的畸形/永不闭合 SSE 帧走 stdlib logging（与 qoder2api.checkin 同属既有机制），不使用 print。
+logger = logging.getLogger("qoder2api.bridge")
 
 
 def now_ms() -> int:
@@ -396,6 +399,18 @@ def normalize_usage(usage: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _unwrap_raw_usage(raw: dict[str, Any]) -> dict[str, Any]:
+    """raw_usage 是包装对象：token 计数嵌在 usage/data 子对象里（出现哪个用哪个，都没有则原样返回）。"""
+    for key in ("usage", "data"):
+        nested = raw.get(key)
+        if isinstance(nested, dict) and any(
+            isinstance(nested.get(k), int)
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens", "promptTokens", "completionTokens")
+        ):
+            return nested
+    return raw
+
+
 def extract_usage(payload_text: str) -> dict[str, Any] | None:
     """从一帧载荷提取上游 usage 统计：顶层 `usage`/`raw_usage`，或老协议 `body` 字符串内嵌；均无则 None。"""
     try:
@@ -407,7 +422,7 @@ def extract_usage(payload_text: str) -> dict[str, Any] | None:
     for key in ("usage", "raw_usage"):
         usage = obj.get(key)
         if isinstance(usage, dict) and usage:
-            return normalize_usage(usage)
+            return normalize_usage(_unwrap_raw_usage(usage) if key == "raw_usage" else usage)
     inner = obj.get("body")
     if isinstance(inner, str) and inner:
         try:
@@ -418,7 +433,7 @@ def extract_usage(payload_text: str) -> dict[str, Any] | None:
             for key in ("usage", "raw_usage"):
                 usage = parsed_inner.get(key)
                 if isinstance(usage, dict) and usage:
-                    return normalize_usage(usage)
+                    return normalize_usage(_unwrap_raw_usage(usage) if key == "raw_usage" else usage)
     return None
 
 
@@ -473,18 +488,61 @@ class ToolCallAccumulator:
             while len(self.calls) <= index:
                 self.calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
             existing = self.calls[index]
-            if isinstance(delta.get("id"), str):
+            if isinstance(delta.get("id"), str) and delta["id"]:
                 existing["id"] = delta["id"]
             if isinstance(delta.get("type"), str):
                 existing["type"] = delta["type"]
             function = delta.get("function") or {}
-            if isinstance(function.get("name"), str):
+            if isinstance(function.get("name"), str) and function["name"]:
                 existing["function"]["name"] = function["name"]
             if isinstance(function.get("arguments"), str):
                 existing["function"]["arguments"] += function["arguments"]
 
     def snapshot(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self.calls)
+
+
+def _json_ok(text: str) -> bool:
+    try:
+        json.loads(text)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+async def _reassemble_sse_lines(raw_lines: AsyncIterator[str]) -> AsyncIterator[str]:
+    buf = ""
+    async for line in raw_lines:
+        if not line:
+            continue
+        if line.startswith("data:"):
+            if buf:
+                # 防御：上一帧未闭合又遇到新帧。能交付则交付一次，否则丢弃并告警，避免脏数据跨帧扩散。
+                if _json_ok(buf):
+                    yield "data: " + buf
+                else:
+                    logger.warning("drop incomplete SSE frame len=%d head=%r", len(buf), buf[:80])
+                buf = ""
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                yield "data: [DONE]"
+                continue
+            if _json_ok(payload):
+                yield "data: " + payload
+            else:
+                buf = payload
+        elif buf:
+            # 续行（无 data: 前缀）：直接拼接（上游断行处无分隔符）
+            buf += line
+            if _json_ok(buf):
+                yield "data: " + buf
+                buf = ""
+        # 无缓冲的非 data: 行（注释 / event:）忽略
+    if buf:
+        if _json_ok(buf):
+            yield "data: " + buf
+        else:
+            logger.warning("drop incomplete SSE frame len=%d head=%r", len(buf), buf[:80])
 
 
 async def qoder_stream_lines(sess: SessionContext, body: dict[str, Any], model: str) -> AsyncIterator[str]:
@@ -503,7 +561,7 @@ async def qoder_stream_lines(sess: SessionContext, body: dict[str, Any], model: 
                 if response.status_code != 200:
                     text = await response.aread()
                     raise RuntimeError(f"HTTP {response.status_code} {text.decode(errors='replace')}")
-                async for line in response.aiter_lines():
+                async for line in _reassemble_sse_lines(response.aiter_lines()):
                     if line:
                         yield line
     else:
@@ -524,7 +582,7 @@ async def qoder_stream_lines(sess: SessionContext, body: dict[str, Any], model: 
                 if response.status_code != 200:
                     text = await response.aread()
                     raise RuntimeError(f"HTTP {response.status_code} {text.decode(errors='replace')}")
-                async for line in response.aiter_lines():
+                async for line in _reassemble_sse_lines(response.aiter_lines()):
                     if line:
                         yield line
 
@@ -576,6 +634,11 @@ async def stream_openai_response(req: dict[str, Any], sess: SessionContext) -> A
             for index, call in enumerate(delta.tool_calls):
                 item = copy.deepcopy(call)
                 item.setdefault("index", index)
+                if not item.get("id"):
+                    item.pop("id", None)
+                fn = item.get("function")
+                if isinstance(fn, dict) and not fn.get("name"):
+                    fn.pop("name", None)
                 indexed.append(item)
             tool_calls.append(indexed)
             out_delta = {"tool_calls": indexed}
