@@ -29,6 +29,7 @@ from .accounts import (
     get_active_session,
     rotate_next_account,
     batch_import_accounts,
+    validate_account_name,
 )
 from .registrar import get_registrar_status, start_registration, stop_registration
 from .tokens import (
@@ -350,6 +351,32 @@ async def toggle_account_api(payload: dict[str, Any], verify: None = Depends(che
         raise HTTPException(status_code=400, detail="uid is required")
     api_mode = "all" if api_enabled else "disabled"
     return await set_account_api_mode({"uid": uid, "api_mode": api_mode}, verify=verify)
+
+
+@app.post("/ui/accounts/rename")
+async def rename_account(payload: dict[str, Any], verify: None = Depends(check_gateway_token)) -> dict[str, Any]:
+    """重命名账号（name 同时是 `model@name` 定向调用与 X-Account 头部的路由键）。"""
+    uid = payload.get("uid")
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid is required")
+    try:
+        new_name = validate_account_name(payload.get("name"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with get_db() as conn:
+        duplicated = conn.execute(
+            "SELECT uid FROM accounts WHERE LOWER(name) = LOWER(?) AND uid != ? LIMIT 1",
+            (new_name, uid),
+        ).fetchone()
+        if duplicated:
+            raise HTTPException(status_code=400, detail=f"名称「{new_name}」已被其它账号使用，请换一个名称")
+        res = conn.execute("UPDATE accounts SET name = ? WHERE uid = ?", (new_name, uid))
+        if res.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Account not found")
+
+    add_log(f"Renamed account UID {uid} to '{new_name}'")
+    return {"status": "ok", "uid": uid, "name": new_name}
 
 
 @app.post("/ui/accounts/refresh-tokens")
