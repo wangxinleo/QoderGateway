@@ -59,6 +59,31 @@ def db_load_accounts() -> dict[str, Any]:
         return {"accounts": accounts, "active_uid": active_uid}
 
 
+# 账号名称同时是 `model@name` 定向调用与 X-Account 头部的路由键，故重命名使用严格校验。
+ACCOUNT_NAME_MAX_LEN = 48
+RESERVED_ACCOUNT_NAMES = ("all", "default", "qoder", "zcode", "custom")
+
+
+def validate_account_name(name: str | None) -> str:
+    """校验重命名用的账号名称，返回 trim 后的名称；非法时抛 ValueError（中文原因）。
+
+    - trim 后非空，且不超过 48 个字符；
+    - 不能包含英文逗号（列表拆分符）、`@`（定向语法分隔符）与控制字符；
+    - 不能是保留字：all/default 会被当成默认池，qoder/zcode/custom 会被当成 provider 偏好；
+    - 与其它账号不区分大小写的唯一性由调用方在事务内查库校验。
+    """
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("账号名称不能为空")
+    if len(clean_name) > ACCOUNT_NAME_MAX_LEN:
+        raise ValueError(f"账号名称长度不能超过 {ACCOUNT_NAME_MAX_LEN} 个字符")
+    if any(ch in ",@" or ord(ch) < 32 or 0x7F <= ord(ch) <= 0x9F for ch in clean_name):
+        raise ValueError("账号名称不能包含英文逗号（,）、@ 或控制字符")
+    if clean_name.lower() in RESERVED_ACCOUNT_NAMES:
+        raise ValueError(f"账号名称「{clean_name}」为系统保留字（all/default/qoder/zcode/custom），无法用于定向调用")
+    return clean_name
+
+
 async def import_current_auth() -> dict[str, Any]:
     """Decrypts current local auth files, queries quota status, and saves to SQLite."""
     sess = load_local_session()

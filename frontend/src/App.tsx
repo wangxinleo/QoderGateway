@@ -118,6 +118,10 @@ const NAV_GROUPS: NavGroupDef[] = [
 
 const NAV_ITEMS = NAV_GROUPS.flatMap(g => g.items)
 
+// 账号名称校验规则与后端 validate_account_name 保持一致（name 是 model@name 定向调用的路由键）
+const ACCOUNT_NAME_MAX_LEN = 48
+const RESERVED_ACCOUNT_NAMES = ['all', 'default', 'qoder', 'zcode', 'custom']
+
 interface GatewayModelInfo {
   id: string
   vendor: string
@@ -320,14 +324,15 @@ function CustomSelect({ value, onChange, options, placeholder }: { value: string
   )
 }
 
-function CustomInput({ value, onChange, placeholder, type = 'text', className = '', mono = false }: {
-  value: string; onChange: (v: string) => void; placeholder?: string; type?: string; className?: string; mono?: boolean
+function CustomInput({ value, onChange, placeholder, type = 'text', className = '', mono = false, onKeyDown }: {
+  value: string; onChange: (v: string) => void; placeholder?: string; type?: string; className?: string; mono?: boolean; onKeyDown?: (e: React.KeyboardEvent<HTMLInputElement>) => void
 }) {
   return (
     <input
       type={type}
       value={value}
       onChange={e => onChange(e.target.value)}
+      onKeyDown={onKeyDown}
       placeholder={placeholder}
       className={`w-full bg-white border border-hairline-strong text-ink text-sm px-4 py-3 rounded-lg outline-none focus:border-ink focus:ring-2 focus:ring-ink/10 transition-all placeholder:text-body/40 ${mono ? 'font-mono' : 'font-medium'} ${className}`}
     />
@@ -541,6 +546,11 @@ export default function App() {
   const [addAccountDomain, setAddAccountDomain] = useState('')
   const [addingAccount, setAddingAccount] = useState(false)
 
+  const [renameAccount, setRenameAccount] = useState<Account | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [renameError, setRenameError] = useState<string | null>(null)
+  const [renamingAccount, setRenamingAccount] = useState(false)
+
   // Multi-provider state
   const [providerFilter, setProviderFilter] = useState<'all' | 'qoder' | 'zcode' | 'custom'>('all')
   const [zcodeApiKey, setZcodeApiKey] = useState('')
@@ -579,6 +589,30 @@ export default function App() {
     aiFailed: lang === 'zh' ? 'AI 请求失败' : 'AI Request Failed',
     responseDone: lang === 'zh' ? '响应已完成' : 'Response Complete',
     connectionError: lang === 'zh' ? '连接失败' : 'Connection Error',
+    rename: {
+      title: lang === 'zh' ? '重命名账号' : 'Rename Account',
+      current: lang === 'zh' ? '当前名称' : 'Current Name',
+      newName: lang === 'zh' ? '新名称' : 'New Name',
+      placeholder: lang === 'zh' ? '输入新的账号名称' : 'Enter a new account name',
+      preview: lang === 'zh' ? '定向调用模型名预览' : 'Target Model Preview',
+      previewHint: lang === 'zh'
+        ? '客户端使用该模型名即可单独调用此账号；重命名后旧名称立即失效，请同步更新已按名称绑定的定向调用。'
+        : 'Use this model name in clients to target this account. The old name stops working right after renaming.',
+      rules: lang === 'zh'
+        ? '规则：名称不能为空、最多 48 个字符；不能包含英文逗号、@ 或控制字符；不能与其它账号重名（不区分大小写）；不可使用保留字 all / default / qoder / zcode / custom。'
+        : 'Rules: non-empty, max 48 characters; no comma, @ or control characters; must be unique (case-insensitive); reserved words all / default / qoder / zcode / custom are not allowed.',
+      save: lang === 'zh' ? '保存' : 'Save',
+      saving: lang === 'zh' ? '保存中...' : 'Saving...',
+      cancel: lang === 'zh' ? '取消' : 'Cancel',
+      renamedTitle: lang === 'zh' ? '账号已重命名' : 'Account Renamed',
+      renamed: (oldName: string, newName: string) => lang === 'zh' ? `账号“${oldName}”已重命名为“${newName}”` : `Renamed "${oldName}" to "${newName}"`,
+      failed: lang === 'zh' ? '重命名失败' : 'Rename Failed',
+      errEmpty: lang === 'zh' ? '账号名称不能为空' : 'Account name cannot be empty',
+      errTooLong: lang === 'zh' ? `账号名称长度不能超过 ${ACCOUNT_NAME_MAX_LEN} 个字符` : `Account name must be at most ${ACCOUNT_NAME_MAX_LEN} characters`,
+      errChars: lang === 'zh' ? '账号名称不能包含英文逗号（,）、@ 或控制字符' : 'Account name cannot contain a comma (,), @ or control characters',
+      errReserved: (name: string) => lang === 'zh' ? `“${name}”是系统保留字（all/default/qoder/zcode/custom），无法用于定向调用` : `"${name}" is a reserved word (all/default/qoder/zcode/custom) and cannot be used for targeting`,
+      errDuplicate: (name: string) => lang === 'zh' ? `名称“${name}”已被其它账号使用，请换一个名称` : `The name "${name}" is already used by another account`,
+    },
   }
   const navLabels: Record<AppTabId, string> = {
     dashboard: t.nav.dashboard,
@@ -1363,6 +1397,46 @@ export default function App() {
       pushToast('SUCCESS', lang === 'zh' ? '账号已删除' : 'Account Deleted', msg.deleted(uid))
       fetchAccounts(); fetchStatus(); fetchLogs()
     } catch (err: any) { pushToast('ERROR', msg.deleteFailed, err.message) }
+  }
+
+  const closeRenameModal = () => { setRenameAccount(null); setRenameError(null); setRenamingAccount(false) }
+
+  // 本地预校验（与后端 validate_account_name 同规则），失败提示按当前界面语言展示
+  const accountNameError = (raw: string): string | null => {
+    const nextName = raw.trim()
+    if (!nextName) return msg.rename.errEmpty
+    // 用码点数而非 UTF-16 长度，与后端 Python len() 对非 BMP 字符（emoji 等）的判定一致
+    if ([...nextName].length > ACCOUNT_NAME_MAX_LEN) return msg.rename.errTooLong
+    if (/[,@]/.test(nextName) || /[\u0000-\u001f\u007f-\u009f]/.test(nextName)) return msg.rename.errChars
+    if (RESERVED_ACCOUNT_NAMES.includes(nextName.toLowerCase())) return msg.rename.errReserved(nextName)
+    if (accountsConfig.accounts.some(a => a.uid !== renameAccount?.uid && a.name.toLowerCase() === nextName.toLowerCase())) return msg.rename.errDuplicate(nextName)
+    return null
+  }
+
+  const handleRenameAccount = async () => {
+    if (!renameAccount || renamingAccount) return
+    const nextName = renameValue.trim()
+    if (nextName === renameAccount.name) return
+    const validationError = accountNameError(renameValue)
+    if (validationError) { setRenameError(validationError); return }
+    setRenamingAccount(true)
+    setRenameError(null)
+    try {
+      const resp = await authedFetch('/ui/accounts/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uid: renameAccount.uid, name: nextName }),
+      })
+      const data = await resp.json().catch(() => ({} as any))
+      if (!resp.ok) { setRenameError(data.detail || msg.rename.failed); return }
+      pushToast('SUCCESS', msg.rename.renamedTitle, msg.rename.renamed(renameAccount.name, data.name || nextName))
+      setRenameAccount(null)
+      fetchAccounts(); fetchStatus(); fetchLogs()
+    } catch (err: any) {
+      setRenameError(err?.message || msg.rename.failed)
+    } finally {
+      setRenamingAccount(false)
+    }
   }
 
   const handleSaveApiConfig = async (newConfig: APIConfig) => {
@@ -2179,6 +2253,13 @@ export default function App() {
                                     title={currentMode === 'disabled' ? (lang === 'zh' ? '已排除 API 调用，无法设为主会话' : 'Excluded from API routing') : 'Activate'}
                                   >
                                     <span className="material-symbols-outlined">play_circle</span>
+                                  </button>
+                                  <button
+                                    onClick={() => { setRenameAccount(acc); setRenameValue(acc.name); setRenameError(null) }}
+                                    className="text-body hover:text-ink"
+                                    title={lang === 'zh' ? '重命名该账号' : 'Rename account'}
+                                  >
+                                    <span className="material-symbols-outlined">edit</span>
                                   </button>
                                   <button onClick={() => handleDeleteAccount(acc.uid)} className="text-body hover:text-red-600" title="Delete"><span className="material-symbols-outlined">delete</span></button>
                                 </div>
@@ -4125,6 +4206,87 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* ─── RENAME ACCOUNT MODAL ─── */}
+      {renameAccount && (() => {
+        const p = renameAccount.provider || 'qoder'
+        const defaultModel = p === 'zcode' ? 'glm-4-flash' : p === 'custom' ? 'custom-model' : 'kimi-k3'
+        const previewName = renameValue.trim() || renameAccount.name
+        const unchanged = renameValue.trim() === renameAccount.name
+        return (
+          <div
+            className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4"
+            onClick={(e) => { if (e.target === e.currentTarget) closeRenameModal() }}
+          >
+            <div className="bg-surface-card border border-hairline rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+              {/* Modal Header */}
+              <div className="flex items-center justify-between px-6 py-5 border-b border-hairline">
+                <div className="flex items-center gap-2.5">
+                  <span className="material-symbols-outlined text-ink text-[22px]">edit</span>
+                  <h3 className="font-bold text-base text-ink">{msg.rename.title}</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeRenameModal}
+                  className="text-body hover:text-ink transition-colors p-1 rounded-lg hover:bg-black/5 cursor-pointer"
+                >
+                  <span className="material-symbols-outlined text-[20px]">close</span>
+                </button>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div className="flex items-center justify-between gap-3 p-3.5 bg-canvas-soft/70 border border-hairline rounded-xl text-xs">
+                  <span className="text-body shrink-0">{msg.rename.current}</span>
+                  <span className="font-bold text-ink break-all text-right">{renameAccount.name}</span>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-[11px] font-semibold text-body uppercase opacity-60 tracking-wider">{msg.rename.newName}</label>
+                  <CustomInput
+                    value={renameValue}
+                    onChange={(v) => { setRenameValue(v); if (renameError) setRenameError(null) }}
+                    placeholder={msg.rename.placeholder}
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleRenameAccount() }}
+                  />
+                </div>
+
+                <div className="p-3.5 rounded-xl bg-canvas-soft/70 border border-hairline space-y-1">
+                  <div className="text-[10px] font-semibold text-body uppercase tracking-wider">{msg.rename.preview}</div>
+                  <div className="font-mono text-sm text-ink break-all">{`${defaultModel}@${previewName}`}</div>
+                  <div className="text-[11px] text-body leading-relaxed">{msg.rename.previewHint}</div>
+                </div>
+
+                <div className="text-[11px] text-body leading-relaxed">{msg.rename.rules}</div>
+
+                {renameError && (
+                  <div className="p-3.5 rounded-xl bg-red-50 border border-red-200 text-xs text-red-800 flex items-start gap-2">
+                    <span className="material-symbols-outlined text-[16px] mt-0.5 shrink-0">error</span>
+                    <span className="break-all">{renameError}</span>
+                  </div>
+                )}
+
+                <div className="pt-1 flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={closeRenameModal}
+                    className="px-4 py-2 text-sm font-semibold text-body border border-hairline rounded-lg hover:text-ink transition-colors cursor-pointer"
+                  >
+                    {msg.rename.cancel}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleRenameAccount}
+                    disabled={unchanged || !renameValue.trim() || renamingAccount}
+                    className="px-5 py-2 bg-ink text-white rounded-lg text-sm font-bold hover:bg-neutral-800 transition-all shadow-sm disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    {renamingAccount ? msg.rename.saving : msg.rename.save}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
 
       <ToastContainer toasts={toasts} dismiss={dismissToast} />
     </div>
